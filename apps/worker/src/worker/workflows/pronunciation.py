@@ -1,15 +1,24 @@
-"""SpeakFix, fragment 1 : vérification de prononciation anglaise.
+"""SpeakFix, fragment 1 + 1.5 : vérification de prononciation anglaise.
 
 Le workflow reçoit une phrase cible et l'enregistrement de l'apprenant
-(base64 ou URL), le transcrit avec Voxtral STT (dans une activité), puis
-aligne mot à mot ce qui a été entendu avec la phrase cible. Il renvoie un
+(base64 ou URL), le transcrit avec Voxtral de deux manières, puis aligne
+mot à mot ce qui a été entendu avec la phrase cible. Il renvoie un
 score, le statut de chaque mot et des conseils phonétiques ciblés pour
 francophones (th, h aspiré, voyelles longues, -ed final, lettres muettes,
 r anglais).
 
+Pourquoi deux transcriptions (fragment 1.5, test du 25 nov 2026) :
+- la transcription standard (voxtral-mini-transcribe-3) est robuste mais
+  reconstitue les mots *voulus* : un francophone qui dit « zink » est
+  entendu « think », et les erreurs de prononciation disparaissent ;
+- la transcription littérale (voxtral-small-latest en chat, prié d'écrire
+  les sons entendus sans rien corriger) rend ces défauts visibles.
+L'alignement utilise la transcription littérale quand elle est exploitable,
+et retombe sur la standard sinon.
+
 L'alignement et la construction du feedback sont des calculs purs : ils
-tournent dans le code du workflow. Seul l'appel réseau (Voxtral) est dans
-une activité, conforme aux règles de déterminisme du SDK.
+tournent dans le code du workflow. Seuls les appels réseau (Voxtral) sont
+dans une activité, conforme aux règles de déterminisme du SDK.
 """
 
 from __future__ import annotations
@@ -57,18 +66,36 @@ class WordResult(BaseModel):
         description="ok | close | sub | missing | extra",
     )
     heard: str | None = Field(
-        default=None, description="Ce que Voxtral a entendu à la place du mot visé."
+        default=None, description="Ce qui a été entendu à la place du mot visé."
     )
     tip: str | None = Field(default=None, description="Conseil phonétique ciblé, en français.")
 
 
 class PronunciationResult(BaseModel):
     target_phrase: str
-    heard_phrase: str = Field(description="Transcription Voxtral de l'enregistrement.")
+    heard_phrase: str = Field(description="Transcription standard de l'enregistrement.")
+    heard_literal: str | None = Field(
+        default=None,
+        description="Transcription littérale des sons entendus (sans correction des défauts de prononciation), si disponible.",
+    )
     score: int = Field(description="Score de prononciation sur 100.")
     words: list[WordResult]
     feedback: str = Field(description="Bilan et conseil principal, en français.")
 
+
+# ------------------------------------------------------------------ transcription littérale (prompt)
+
+LITERAL_TRANSCRIPTION_PROMPT = (
+    "You are an exacting English teacher grading the pronunciation of French learners. "
+    "The audio is a French speaker reading an English sentence aloud. "
+    "Write down ONLY the sounds you actually hear, as if you had no idea what the sentence is "
+    "meant to be: spell mispronounced words with plausible English letter combinations "
+    '(for instance "zink" instead of "think", "ze" instead of "the", "tree" instead of "three", '
+    '"ate" instead of "hate"). '
+    "Do not correct, complete, or normalize anything; keep the original word order. "
+    'Reply on a single line starting with "LITERAL: " followed by your literal transcription, '
+    "nothing else."
+)
 
 # ------------------------------------------------------------------ conseils phonétiques (données)
 
@@ -229,6 +256,34 @@ def align_words(target_phrase: str, heard_phrase: str) -> list[tuple[str, str, s
     return ops
 
 
+def extract_literal_transcript(raw: str | None) -> str | None:
+    """Extrait la transcription littérale de la réponse du modèle audio.
+
+    Le prompt demande une réponse de la forme « LITERAL: ... ». On tolère :
+    réponse sans label, guillemets autour, ponctuation finale, réponse sur
+    plusieurs lignes (on garde la première ligne exploitable). Un refus
+    manifeste du modèle ( « I cannot... », « I'm sorry... » ) renvoie None
+    pour que le workflow retombe sur la transcription standard.
+    """
+    if not raw:
+        return None
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if lowered.startswith("literal"):
+            line = line.split(":", 1)[1].strip() if ":" in line else line[len("literal"):].strip()
+        if lowered.startswith(
+            ("i cannot", "i'm sorry", "i can't", "sorry", "unfortunately", "as an ai")
+        ):
+            return None
+        line = line.strip("\"'“”‘’ .!")
+        if any(ch.isalpha() for ch in line):
+            return line
+    return None
+
+
 def _tip_for(word: str, status: str, heard: str | None) -> str | None:
     """Choisit le conseil phonétique le plus pertinent pour un mot raté."""
     w = word.lower()
@@ -265,8 +320,18 @@ def build_feedback(score: int, words: list[WordResult]) -> str:
 @workflows.activity()
 async def transcribe_recording(
     audio_base64: str | None, audio_url: str | None, audio_file_name: str
-) -> str:
-    """Transcrit l'enregistrement avec Voxtral STT et renvoie le texte entendu."""
+) -> list:
+    """Transcrit l'enregistrement de deux manières, dans une activité.
+
+    1. Transcription standard (voxtral-mini-transcribe-3) : robuste, mais
+       elle reconstitue les mots voulus et gomme l'accent (voir docstring).
+    2. Transcription littérale (voxtral-small-latest, mode chat avec
+       input_audio + prompt) : rend les défauts de prononciation visibles.
+       Si elle échoue (erreur réseau, refus du modèle), on renvoie None
+       et le workflow retombe sur la transcription standard.
+
+    Renvoie [transcription_standard, transcription_litterale | None].
+    """
     # Récupération des octets : décodage base64 ou téléchargement de l'URL.
     if audio_base64:
         audio_bytes = base64.b64decode(audio_base64)
@@ -277,10 +342,11 @@ async def transcribe_recording(
         with urllib.request.urlopen(audio_url, timeout=60) as response:  # noqa: S310
             audio_bytes = response.read()
         file_name = audio_url.rsplit("/", 1)[-1] or audio_file_name
+    audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
 
     client = get_mistral_client()
 
-    def _transcribe() -> str:
+    def _standard() -> str:
         transcription = client.audio.transcriptions.complete(
             model="voxtral-mini-transcribe-3",
             file={"file_name": file_name, "content": audio_bytes},
@@ -288,9 +354,32 @@ async def transcribe_recording(
         )
         return (transcription.text or "").strip()
 
-    # L'appel SDK est bloquant : on l'exécute dans un thread pour ne pas
-    # bloquer la boucle d'événements du worker.
-    return await asyncio.to_thread(_transcribe)
+    def _literal() -> str | None:
+        try:
+            response = client.chat.complete(
+                model="voxtral-small-latest",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_audio", "input_audio": audio_b64},
+                            {"type": "text", "text": LITERAL_TRANSCRIPTION_PROMPT},
+                        ],
+                    }
+                ],
+                temperature=0,
+            )
+        except Exception:
+            return None  # la correction littérale ne doit jamais casser l'analyse
+        raw = response.choices[0].message.content
+        return extract_literal_transcript(raw)
+
+    def _both() -> list:
+        return [_standard(), _literal()]
+
+    # Les appels SDK sont bloquants : on les exécute dans un thread pour ne
+    # pas bloquer la boucle d'événements du worker.
+    return await asyncio.to_thread(_both)
 
 
 # ------------------------------------------------------------------ workflow
@@ -300,20 +389,24 @@ async def transcribe_recording(
     name="pronunciation-check",
     workflow_display_name="SpeakFix : check de prononciation",
     workflow_description=(
-        "Transcrit un enregistrement de l'apprenant avec Voxtral STT, l'aligne mot à mot "
-        "avec la phrase cible et renvoie score, mots ratés et conseils phonétiques."
+        "Transcrit un enregistrement de l'apprenant avec Voxtral (standard + littérale), "
+        "aligne mot à mot la transcription la plus fine avec la phrase cible et renvoie "
+        "score, mots ratés et conseils phonétiques."
     ),
 )
 class PronunciationCheckWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, input: PronunciationInput) -> PronunciationResult:
-        # 1. Transcription (réseau, dans une activité).
-        heard = await transcribe_recording(
+        # 1. Transcriptions (réseau, dans une activité).
+        heard, heard_literal = await transcribe_recording(
             input.audio_base64, input.audio_url, input.audio_file_name
         )
 
         # 2. Alignement et score (calculs purs, dans le workflow).
-        ops = align_words(input.target_phrase, heard)
+        # La transcription littérale cache les défauts de prononciation :
+        # on l'utilise pour l'alignement dès qu'elle est exploitable.
+        analyzed = heard_literal if heard_literal else heard
+        ops = align_words(input.target_phrase, analyzed)
         words: list[WordResult] = []
         ok_count = 0
         close_count = 0
@@ -351,6 +444,7 @@ class PronunciationCheckWorkflow:
         return PronunciationResult(
             target_phrase=input.target_phrase,
             heard_phrase=heard,
+            heard_literal=heard_literal,
             score=score,
             words=words,
             feedback=feedback,

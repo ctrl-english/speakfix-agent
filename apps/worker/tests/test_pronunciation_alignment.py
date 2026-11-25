@@ -1,4 +1,4 @@
-"""Tests unitaires de la logique pure d'alignement (sans SDK, exécutables partout)."""
+"""Tests unitaires de la logique pure (sans SDK, exécutables partout)."""
 
 from __future__ import annotations
 
@@ -163,6 +163,62 @@ def test_tip_for_sub_leverages_word_tips():
     mod = _load_module()
     tip = mod._tip_for("think", "sub", "sink")
     assert "sink" in tip and "langue" in tip
+
+
+def test_extract_literal_strips_label():
+    mod = _load_module()
+    raw = mod.extract_literal_transcript("LITERAL: I zink zis is ze zeird monf")
+    assert raw == "I zink zis is ze zeird monf"
+
+
+def test_extract_literal_plain_line():
+    mod = _load_module()
+    raw = mod.extract_literal_transcript('  "I think this is the third month."  ')
+    assert raw == "I think this is the third month"
+
+
+def test_extract_literal_first_usable_line():
+    mod = _load_module()
+    raw = mod.extract_literal_transcript("\n\nLITERAL: I zink this is ze zeird month.\n\n")
+    assert raw == "I zink this is ze zeird month"
+
+
+def test_extract_literal_refusal_returns_none():
+    mod = _load_module()
+    assert mod.extract_literal_transcript("I cannot listen to this audio.") is None
+    assert mod.extract_literal_transcript("I'm sorry, but the recording is silent.") is None
+
+
+def test_extract_literal_empty_returns_none():
+    mod = _load_module()
+    assert mod.extract_literal_transcript(None) is None
+    assert mod.extract_literal_transcript("") is None
+    assert mod.extract_literal_transcript("   \n  ") is None
+
+
+def test_literal_alignment_flags_mangled_th():
+    mod = _load_module()
+    ops = mod.align_words(
+        "I think this is the third month.", "I zink zis is ze zeird monf"
+    )
+    subs = [op for op in ops if op[0] == "sub"]
+    # think -> zink et third -> zeird doivent être signalés comme substitutions.
+    assert any(op[1] == "think" and op[2] == "zink" for op in subs)
+    assert any(op[1] == "third" and op[2] == "zeird" for op in subs)
+    # month -> monf : le th final a disparu, distance 2, donc « sub ».
+    assert any(op[1] == "month" and op[2] == "monf" for op in subs)
+
+
+def test_literal_alignment_scores_mangled_th_low():
+    mod = _load_module()
+    ops = mod.align_words(
+        "I think this is the third month.", "I zink zis is ze zeird monf"
+    )
+    target_count = sum(1 for status, _, _ in ops if status != "extra")
+    ok_count = sum(1 for status, _, _ in ops if status == "ok")
+    close_count = sum(1 for status, _, _ in ops if status == "close")
+    score = round((ok_count + close_count * 0.75) * 100 / target_count)
+    assert score < 50  # une phrase massacrée ne doit plus fikser à 100
 
 
 if __name__ == "__main__":
