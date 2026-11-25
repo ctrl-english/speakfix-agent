@@ -12,18 +12,14 @@ ENV UV_PYTHON_PREFERENCE=only-system \
     UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
     UV_COMPILE_BYTECODE_TIMEOUT=900
-# NOTE (speakfix): uv.lock est généré ici au build (résolution publique PyPI), car le répertoire
-# pousse sans lockfile. Si un uv.lock est présent dans le contexte, il écrase celui généré,
-# ce qui rétablit le comportement reproductible d'origine.
-COPY pyproject.toml ./
-COPY tools/uv.sh tools/
+COPY . .
+# uv.lock est résolu au build (index public PyPI) une fois la source complète copiée,
+# puis les étapes --frozen suivantes le réutilisent. Si un uv.lock commit écrase,
+# la résolution repart de lui et la reproductibilité d'origine est rétablie.
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash tools/uv.sh lock
 RUN --mount=type=secret,id=registry_token --mount=type=cache,target=/root/.cache/uv \
-    bash tools/uv.sh sync --all-packages --no-dev --no-install-local
-COPY . .
-RUN --mount=type=secret,id=registry_token --mount=type=cache,target=/root/.cache/uv \
-    bash tools/uv.sh sync --all-packages --frozen --no-dev
+    bash tools/uv.sh sync --all-packages --no-dev
 
 FROM python:3.14-slim AS runtime
 COPY --from=ghcr.io/astral-sh/uv:0.11.17 /uv /uvx /bin/
